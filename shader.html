@@ -1,0 +1,537 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Fogged Window — Shader</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #111;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+    color: #fff;
+    touch-action: none;
+    overscroll-behavior: none;
+  }
+  .stage {
+    position: fixed;
+    inset: 0;
+    overflow: hidden;
+    cursor: grab;
+  }
+  .stage.dragging { cursor: grabbing; }
+  .stage canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  .stage img { display: none; }
+  .toolbar {
+    position: fixed;
+    top: 16px;
+    right: 16px;
+    z-index: 10;
+  }
+  .toolbar button {
+    background: rgba(0,0,0,0.35);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border: 1px solid rgba(255,255,255,0.18);
+    color: #fff;
+    width: 40px; height: 40px;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: background 0.2s ease;
+  }
+  .toolbar button:hover { background: rgba(0,0,0,0.55); }
+  .toolbar button:active svg { transform: rotate(-360deg); transition: transform 0.5s ease; }
+  .toolbar button svg { transition: transform 0.4s ease; }
+</style>
+</head>
+<body>
+  <div class="stage" id="stage">
+    <img id="photo" alt="" crossorigin="anonymous"
+         src="https://picsum.photos/seed/window-spring/1600/1000">
+    <canvas id="gl"></canvas>
+  </div>
+
+  <div class="toolbar">
+    <button id="reload" aria-label="景色を入れ替える">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="23 4 23 10 17 10"></polyline>
+        <polyline points="1 20 1 14 7 14"></polyline>
+        <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+      </svg>
+    </button>
+  </div>
+
+<script>
+"use strict";
+
+const VS = `#version 300 es
+in vec2 a_pos;
+out vec2 v_uv;
+void main() {
+  v_uv = a_pos * 0.5 + 0.5;
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+}`;
+
+// Brush: stamp a soft disc into the wipe-mask FBO
+const BRUSH_VS = `#version 300 es
+in vec2 a_pos;
+uniform vec2 u_center;     // mask-pixel coords (origin bottom-left)
+uniform float u_radius;    // mask pixels
+uniform vec2 u_resolution; // mask size in pixels
+out vec2 v_local;
+void main() {
+  v_local = a_pos;
+  vec2 world = u_center + a_pos * u_radius;
+  vec2 clip = (world / u_resolution) * 2.0 - 1.0;
+  gl_Position = vec4(clip, 0.0, 1.0);
+}`;
+const BRUSH_FS = `#version 300 es
+precision highp float;
+in vec2 v_local;
+uniform float u_strength;
+out vec4 fragColor;
+void main() {
+  float d = length(v_local);
+  if (d > 1.0) discard;
+  float a = smoothstep(1.0, 0.0, d);
+  a = pow(a, 0.7);
+  fragColor = vec4(1.0, 1.0, 1.0, a * u_strength);
+}`;
+
+// Final composite: photo + fog + drops + wipe-mask
+const FINAL_FS = `#version 300 es
+precision highp float;
+
+uniform sampler2D u_photo;
+uniform sampler2D u_mask;
+uniform vec2 u_resolution;
+uniform float u_canvasAspect;
+uniform float u_photoAspect;
+uniform float u_seed;
+
+in vec2 v_uv;
+out vec4 fragColor;
+
+vec2 coverUv(vec2 uv) {
+  float ca = u_canvasAspect;
+  float pa = u_photoAspect;
+  if (pa > ca) {
+    float s = ca / pa;
+    return vec2(0.5 + (uv.x - 0.5) * s, uv.y);
+  } else {
+    float s = pa / ca;
+    return vec2(uv.x, 0.5 + (uv.y - 0.5) * s);
+  }
+}
+
+float hash(vec2 p) {
+  p = fract(p * vec2(123.34, 456.21));
+  p += dot(p, p + 45.32);
+  return fract(p.x * p.y);
+}
+vec2 hash2(vec2 p) { return vec2(hash(p + 1.7), hash(p + 9.3)); }
+
+// Returns (amount, normalX, normalY) of the strongest drop affecting this pixel
+vec3 dropField(vec2 uv) {
+  // Aspect-corrected UV so cells are square-ish
+  float ar = u_resolution.x / u_resolution.y;
+  vec2 auv = vec2(uv.x * ar, uv.y);
+  float density = 16.0; // cells per unit in y
+  vec2 gp = auv * density;
+  vec2 cell = floor(gp);
+  vec2 frac = fract(gp);
+
+  vec3 best = vec3(0.0);
+  for (int j = -1; j <= 1; j++) {
+    for (int i = -1; i <= 1; i++) {
+      vec2 nb = vec2(float(i), float(j));
+      vec2 cellId = cell + nb;
+
+      // Existence (about 55% of cells have a drop)
+      float existsKey = hash(cellId + u_seed * 7.7);
+      if (existsKey > 0.55) continue;
+
+      vec2 rnd = hash2(cellId + u_seed);
+      vec2 center = nb + 0.15 + rnd * 0.7;
+      // Power-law radius: many small, few big
+      float rk = hash(cellId + u_seed * 3.1);
+      float radius = 0.06 + pow(rk, 2.5) * 0.55;
+
+      vec2 d = frac - center;
+      float dist = length(d);
+
+      // Drop body (sphere normal)
+      if (dist < radius) {
+        float t = dist / radius;
+        float a = smoothstep(1.0, 0.65, t);
+        vec2 n = d / radius;
+        if (a > best.x) best = vec3(a, n);
+      }
+
+      // Trickle trail above the drop (where water ran down from)
+      float trailKey = hash(cellId + u_seed * 19.7);
+      if (trailKey > 0.55) {
+        float trailLen = (0.6 + trailKey * 1.0) * (0.5 + rk);
+        float halfW = radius * (0.18 + 0.10 * rk);
+        if (d.y > 0.0 && d.y < trailLen && abs(d.x) < halfW) {
+          float fy = 1.0 - d.y / trailLen;
+          float fx = 1.0 - abs(d.x) / halfW;
+          float trail = fy * fx * 0.55;
+          if (trail > best.x) best = vec3(trail, vec2(0.0));
+        }
+      }
+    }
+  }
+  return best;
+}
+
+vec3 sampleBlur(vec2 uv) {
+  // Two LOD-tap blur using mipmap (cheap "frosted" look)
+  vec2 px = 1.0 / u_resolution;
+  vec3 c = vec3(0.0);
+  c += textureLod(u_photo, uv, 5.5).rgb * 0.36;
+  c += textureLod(u_photo, uv + vec2(px.x*2.0, 0.0), 5.0).rgb * 0.16;
+  c += textureLod(u_photo, uv - vec2(px.x*2.0, 0.0), 5.0).rgb * 0.16;
+  c += textureLod(u_photo, uv + vec2(0.0, px.y*2.0), 5.0).rgb * 0.16;
+  c += textureLod(u_photo, uv - vec2(0.0, px.y*2.0), 5.0).rgb * 0.16;
+  return c;
+}
+
+void main() {
+  vec2 uv = v_uv;
+
+  vec3 drop = dropField(uv);
+  float dropAmt = drop.x;
+  vec2 dropN = drop.yz;
+
+  // Refraction inside drop body (skips trails since their normal is 0)
+  vec2 refractUv = uv - dropN * 0.020 * dropAmt;
+  vec2 photoUvDrop = coverUv(refractUv);
+  vec2 photoUv     = coverUv(uv);
+
+  vec3 clearDrop = textureLod(u_photo, photoUvDrop, 0.0).rgb;
+  vec3 clearFlat = textureLod(u_photo, photoUv,     0.0).rgb;
+
+  // Frosted glass background
+  vec3 blurC = sampleBlur(photoUv);
+  vec3 fogC  = mix(blurC, vec3(0.93, 0.96, 0.98), 0.5);
+  // Subtle grain
+  float grain = (hash(uv * u_resolution + u_seed * 13.0) - 0.5) * 0.045;
+  fogC += grain;
+
+  // Wipe mask (alpha channel from brush stamps)
+  float mask = texture(u_mask, uv).a;
+
+  // Drops show clearer than fog. They magnify a bit so we use refracted sample.
+  // Use clearDrop where dropAmt > 0, otherwise wipe-mask reveals clearFlat.
+  vec3 col = mix(fogC, clearFlat, mask);
+  // Drop reveal: blend drop's clear sample on top of whatever the fog/mask gave us
+  col = mix(col, clearDrop, dropAmt);
+
+  // Drop shading: light from above. Highlight on upper part, dark rim at bottom.
+  if (dropAmt > 0.05) {
+    float top = max(dropN.y, 0.0);
+    float spec = pow(top, 12.0) * dropAmt;
+    col += vec3(spec * 0.55);
+
+    float bot = max(-dropN.y, 0.0);
+    float caustic = pow(bot, 5.0) * dropAmt;
+    col += vec3(caustic * 0.18);
+
+    // Slight darkening on far rim for depth
+    float rim = pow(1.0 - abs(dropN.y), 2.5) * dropAmt;
+    col -= vec3(rim * 0.04);
+  }
+
+  fragColor = vec4(col, 1.0);
+}`;
+
+(() => {
+  const stage    = document.getElementById('stage');
+  const photo    = document.getElementById('photo');
+  const canvas   = document.getElementById('gl');
+  const reloadBtn= document.getElementById('reload');
+
+  const gl = canvas.getContext('webgl2', { premultipliedAlpha: false, antialias: false });
+  if (!gl) {
+    document.body.innerHTML = '<p style="padding:20px">WebGL2 not supported.</p>';
+    return;
+  }
+
+  function compile(type, src) {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      console.error(gl.getShaderInfoLog(sh), src);
+      throw new Error('shader compile failed');
+    }
+    return sh;
+  }
+  function link(vs, fs) {
+    const p = gl.createProgram();
+    gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+    gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+    gl.bindAttribLocation(p, 0, 'a_pos');
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      console.error(gl.getProgramInfoLog(p));
+      throw new Error('program link failed');
+    }
+    return p;
+  }
+
+  const finalProg = link(VS, FINAL_FS);
+  const brushProg = link(BRUSH_VS, BRUSH_FS);
+
+  // Quad
+  const quad = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+
+  // Final program uniforms
+  const uPhoto = gl.getUniformLocation(finalProg, 'u_photo');
+  const uMask  = gl.getUniformLocation(finalProg, 'u_mask');
+  const uRes   = gl.getUniformLocation(finalProg, 'u_resolution');
+  const uCAsp  = gl.getUniformLocation(finalProg, 'u_canvasAspect');
+  const uPAsp  = gl.getUniformLocation(finalProg, 'u_photoAspect');
+  const uSeed  = gl.getUniformLocation(finalProg, 'u_seed');
+
+  // Brush program uniforms
+  const bCenter = gl.getUniformLocation(brushProg, 'u_center');
+  const bRadius = gl.getUniformLocation(brushProg, 'u_radius');
+  const bRes    = gl.getUniformLocation(brushProg, 'u_resolution');
+  const bStrength = gl.getUniformLocation(brushProg, 'u_strength');
+
+  // Photo texture
+  const photoTex = gl.createTexture();
+  function uploadPhoto() {
+    gl.bindTexture(gl.TEXTURE_2D, photoTex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, photo);
+    gl.generateMipmap(gl.TEXTURE_2D);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+
+  // Wipe-mask FBO
+  let maskTex = null, maskFbo = null;
+  let maskW = 0, maskH = 0;
+  function createMask(w, h) {
+    if (maskTex) gl.deleteTexture(maskTex);
+    if (maskFbo) gl.deleteFramebuffer(maskFbo);
+    maskW = w; maskH = h;
+    maskTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, maskTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    maskFbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, maskFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, maskTex, 0);
+    gl.viewport(0, 0, w, h);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
+  function setupQuadAttrib() {
+    gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  }
+
+  // Draw a brush stamp into the mask FBO at mask-pixel coords (origin bottom-left)
+  function stamp(cx, cy, radius, strength) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, maskFbo);
+    gl.viewport(0, 0, maskW, maskH);
+    gl.useProgram(brushProg);
+    setupQuadAttrib();
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.uniform2f(bCenter, cx, cy);
+    gl.uniform1f(bRadius, radius);
+    gl.uniform2f(bRes, maskW, maskH);
+    gl.uniform1f(bStrength, strength);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
+  // Stamp a stroke from prev → cur (bridges fast moves)
+  const BRUSH_R_CSS = 42; // CSS px — matches the canvas2d feel
+  const STAMP_STRENGTH = 0.55;
+  function brushRadius() { return BRUSH_R_CSS * dpr; }
+  function strokeTo(cx, cy, prev) {
+    if (!prev) {
+      stamp(cx, cy, brushRadius(), STAMP_STRENGTH);
+      return;
+    }
+    const dx = cx - prev.x, dy = cy - prev.y;
+    const dist = Math.hypot(dx, dy);
+    const stride = 6;
+    const n = Math.max(1, Math.ceil(dist / stride));
+    for (let i = 1; i <= n; i++) {
+      const t = i / n;
+      stamp(prev.x + dx * t, prev.y + dy * t, brushRadius(), STAMP_STRENGTH);
+    }
+  }
+
+  // Convert pointer event → mask-pixel coords (origin bottom-left)
+  let dpr = 1;
+  function pointerToMask(e) {
+    const r = canvas.getBoundingClientRect();
+    const cssX = e.clientX - r.left;
+    const cssY = e.clientY - r.top;
+    return { x: cssX * dpr, y: maskH - cssY * dpr };
+  }
+
+  // Pre-cleared continuous one-stroke trace
+  function drawPrecleared() {
+    const w = maskW, h = maskH;
+    const margin = Math.min(w, h) * 0.15;
+    const minDist = Math.min(w, h) * 0.22;
+    const n = 5 + Math.floor(Math.random() * 3);
+    const pts = [];
+    let guard = 0;
+    while (pts.length < n && guard++ < 400) {
+      const p = {
+        x: margin + Math.random() * (w - 2 * margin),
+        y: margin + Math.random() * (h - 2 * margin),
+      };
+      const last = pts[pts.length - 1];
+      if (last && Math.hypot(p.x - last.x, p.y - last.y) < minDist) continue;
+      pts.push(p);
+    }
+    let prev = null;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const p0 = pts[Math.max(0, i - 1)];
+      const p1 = pts[i];
+      const p2 = pts[i + 1];
+      const p3 = pts[Math.min(pts.length - 1, i + 2)];
+      const segLen = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      const steps = Math.max(12, Math.floor(segLen / 5));
+      for (let s = 0; s < steps; s++) {
+        const t = s / steps;
+        const t2 = t * t, t3 = t2 * t;
+        const x = 0.5 * (2*p1.x + (-p0.x + p2.x) * t
+               + (2*p0.x - 5*p1.x + 4*p2.x - p3.x) * t2
+               + (-p0.x + 3*p1.x - 3*p2.x + p3.x) * t3);
+        const y = 0.5 * (2*p1.y + (-p0.y + p2.y) * t
+               + (2*p0.y - 5*p1.y + 4*p2.y - p3.y) * t2
+               + (-p0.y + 3*p1.y - 3*p2.y + p3.y) * t3);
+        strokeTo(x, y, prev);
+        prev = { x, y };
+      }
+    }
+    const tail = pts[pts.length - 1];
+    strokeTo(tail.x, tail.y, prev);
+  }
+
+  // Per-load randomization
+  let seed = Math.random() * 1000.0;
+
+  function render() {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.useProgram(finalProg);
+    setupQuadAttrib();
+    gl.disable(gl.BLEND);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, photoTex);
+    gl.uniform1i(uPhoto, 0);
+
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, maskTex);
+    gl.uniform1i(uMask, 1);
+
+    const cAsp = canvas.width / canvas.height;
+    const pAsp = (photo.naturalWidth && photo.naturalHeight)
+      ? photo.naturalWidth / photo.naturalHeight
+      : cAsp;
+    gl.uniform2f(uRes, canvas.width, canvas.height);
+    gl.uniform1f(uCAsp, cAsp);
+    gl.uniform1f(uPAsp, pAsp);
+    gl.uniform1f(uSeed, seed);
+
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
+  function resize() {
+    dpr = Math.max(1, window.devicePixelRatio || 1);
+    const w = stage.clientWidth;
+    const h = stage.clientHeight;
+    canvas.width  = Math.floor(w * dpr);
+    canvas.height = Math.floor(h * dpr);
+    canvas.style.width  = w + 'px';
+    canvas.style.height = h + 'px';
+    createMask(canvas.width, canvas.height);
+    if (photo.complete && photo.naturalWidth > 0) {
+      drawPrecleared();
+      render();
+    }
+  }
+
+  // Pointer handling
+  let drawing = false;
+  let lastP = null;
+  canvas.addEventListener('pointerdown', (e) => {
+    drawing = true;
+    stage.classList.add('dragging');
+    canvas.setPointerCapture?.(e.pointerId);
+    const p = pointerToMask(e);
+    strokeTo(p.x, p.y, null);
+    lastP = p;
+    render();
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    if (!drawing) return;
+    const p = pointerToMask(e);
+    strokeTo(p.x, p.y, lastP);
+    lastP = p;
+    render();
+  });
+  const endPointer = () => {
+    drawing = false;
+    stage.classList.remove('dragging');
+    lastP = null;
+  };
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+  canvas.addEventListener('pointerleave', endPointer);
+
+  reloadBtn.addEventListener('click', () => {
+    const s = Math.random().toString(36).slice(2, 9);
+    photo.src = `https://picsum.photos/seed/${s}/1600/1000`;
+    seed = Math.random() * 1000.0;
+  });
+
+  photo.addEventListener('load', () => {
+    uploadPhoto();
+    resize();
+  });
+  window.addEventListener('resize', resize);
+
+  if (photo.complete && photo.naturalWidth > 0) {
+    uploadPhoto();
+    resize();
+  }
+})();
+</script>
+</body>
+</html>
