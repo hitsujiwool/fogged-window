@@ -410,9 +410,20 @@
     if (req) req.call(el).catch(() => {});
   }
 
+  // 一定時間操作がなければ曇りガラスを初期状態に戻す
+  const IDLE_MS = 60000;
+  let idleTimer = null;
+  function resetIdleTimer() {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      if (photo.complete && photo.naturalWidth > 0) paintFog();
+    }, IDLE_MS);
+  }
+
   let drawing = false;
   function onDown(e) {
     tryFullscreen();
+    resetIdleTimer();
     drawing = true;
     stage.classList.add('dragging');
     canvas.setPointerCapture?.(e.pointerId);
@@ -424,6 +435,7 @@
   }
   function onMove(e) {
     if (!drawing) return;
+    resetIdleTimer();
     const p = pointerPos(e);
     eraseAt(p.x, p.y, lastPoint);
     const now = e.timeStamp || performance.now();
@@ -459,12 +471,14 @@
   photo.addEventListener('load', () => {
     setLoading(false);
     resize();
+    resetIdleTimer();
   });
   photo.addEventListener('error', () => setLoading(false));
   window.addEventListener('resize', resize);
 
   if (photo.complete && photo.naturalWidth > 0) {
     resize();
+    resetIdleTimer();
   } else {
     setLoading(true);
   }
