@@ -3,6 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- ホーム画面に追加するとブラウザUIなしで起動（iOS / Android） -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Fogged Window">
+<meta name="theme-color" content="#111111">
+<link rel="manifest" href="manifest.webmanifest">
 <title>Fogged Window</title>
 <style>
   html, body {
@@ -393,8 +400,19 @@
     audio.squeakGain.gain.setTargetAtTime(0, now, 0.025);
   }
 
+  // 最初に画面へ触れたタイミングでフルスクリーンへ（ブラウザはユーザー操作必須のため）
+  let fullscreenTried = false;
+  function tryFullscreen() {
+    if (fullscreenTried) return;
+    fullscreenTried = true;
+    const el = document.documentElement;
+    const req = el.requestFullscreen || el.webkitRequestFullscreen;
+    if (req) req.call(el).catch(() => {});
+  }
+
   let drawing = false;
   function onDown(e) {
+    tryFullscreen();
     drawing = true;
     stage.classList.add('dragging');
     canvas.setPointerCapture?.(e.pointerId);

@@ -1,0 +1,9 @@
+{
+  "name": "Fogged Window",
+  "short_name": "Fogged",
+  "display": "fullscreen",
+  "orientation": "any",
+  "background_color": "#111111",
+  "theme_color": "#111111",
+  "start_url": "."
+}
